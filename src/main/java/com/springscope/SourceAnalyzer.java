@@ -1,16 +1,23 @@
 
 package com.springscope;
 
-import com.github.javaparser.StaticJavaParser;
+import com.github.javaparser.JavaParser;
+import com.github.javaparser.ParseResult;
+import com.github.javaparser.ParserConfiguration;
 import com.github.javaparser.ast.CompilationUnit;
-import com.github.javaparser.ast.NodeList;
 import com.github.javaparser.ast.body.ClassOrInterfaceDeclaration;
 import com.github.javaparser.ast.body.ConstructorDeclaration;
 import com.github.javaparser.ast.body.MethodDeclaration;
-import com.github.javaparser.ast.expr.*;
-
+import com.github.javaparser.ast.expr.AnnotationExpr;
+import com.github.javaparser.ast.expr.ArrayInitializerExpr;
+import com.github.javaparser.ast.expr.Expression;
+import com.github.javaparser.ast.expr.NormalAnnotationExpr;
+import com.github.javaparser.ast.expr.SingleMemberAnnotationExpr;
+import com.github.javaparser.ast.expr.StringLiteralExpr;
+import com.github.javaparser.ast.nodeTypes.NodeWithAnnotations;
 import org.springframework.stereotype.Component;
 
+import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.*;
@@ -20,316 +27,439 @@ import java.util.stream.Stream;
 public class SourceAnalyzer {
 
     private static final Set<String> BEAN_ANNOTATIONS = Set.of(
-            "Component", "Service", "Repository",
-            "Controller", "RestController"
+            "Component",
+            "Service",
+            "Repository",
+            "Controller",
+            "RestController",
+            "Configuration"
     );
 
-    private static final Map<String, String> HTTP_MAPPINGS = Map.of(
-            "GetMapping", "GET",
-            "PostMapping", "POST",
-            "PutMapping", "PUT",
-            "DeleteMapping", "DELETE",
-            "PatchMapping", "PATCH"
+    private static final Set<String> MAPPING_ANNOTATIONS = Set.of(
+            "RequestMapping",
+            "GetMapping",
+            "PostMapping",
+            "PutMapping",
+            "DeleteMapping",
+            "PatchMapping"
     );
 
-    public record Dependency(String source, String target) {}
+    private final JavaParser parser;
 
-    public record Endpoint(
-            String controller,
-            String httpMethod,
-            String path
-    ) {}
+    public SourceAnalyzer() {
+        ParserConfiguration configuration = new ParserConfiguration()
+                .setLanguageLevel(
+                        ParserConfiguration.LanguageLevel.JAVA_21);
 
-    public record AnalysisResult(
-            Set<String> beans,
-            List<Dependency> dependencies,
-            List<String> cycles,
-            List<Endpoint> endpoints
-    ) {}
+        this.parser = new JavaParser(configuration);
+    }
 
-    public AnalysisResult analyze(Path root) throws Exception {
+    public AnalysisResult analyze(Path sourceRoot) throws IOException {
 
-        if (!Files.isDirectory(root)) {
+        if (sourceRoot == null || !Files.exists(sourceRoot)) {
             throw new IllegalArgumentException(
-                    "Source directory does not exist: " + root
-            );
+                    "Source path does not exist: " + sourceRoot);
         }
 
-        Map<String, ClassOrInterfaceDeclaration> beanClasses =
-                new LinkedHashMap<>();
+        if (!Files.isDirectory(sourceRoot)) {
+            throw new IllegalArgumentException(
+                    "Source path must be a directory: " + sourceRoot);
+        }
 
         List<CompilationUnit> units = new ArrayList<>();
 
-        try (Stream<Path> paths = Files.walk(root)) {
-            paths.filter(Files::isRegularFile)
-                    .filter(p -> p.toString().endsWith(".java"))
-                    .forEach(path -> {
-                        try {
-                            units.add(StaticJavaParser.parse(path));
-                        } catch (Exception e) {
-                            System.err.println(
-                                    "Skipping unreadable Java file: " + path
-                            );
-                        }
-                    });
-        }
+        try (Stream<Path> paths = Files.walk(sourceRoot)) {
+            List<Path> javaFiles = paths
+                    .filter(Files::isRegularFile)
+                    .filter(path -> path.toString().endsWith(".java"))
+                    .toList();
 
-        // Step 1: Detect Spring bean classes.
-        for (CompilationUnit unit : units) {
-            for (ClassOrInterfaceDeclaration type :
-                    unit.findAll(ClassOrInterfaceDeclaration.class)) {
+            for (Path javaFile : javaFiles) {
+                ParseResult<CompilationUnit> parsed = parser.parse(javaFile);
 
-                boolean isBean = type.getAnnotations().stream()
-                        .anyMatch(a -> BEAN_ANNOTATIONS.contains(
-                                a.getNameAsString()
-                        ));
-
-                if (isBean) {
-                    String name = type.getNameAsString();
-                    beanClasses.putIfAbsent(name, type);
+                if (parsed.getResult().isPresent()) {
+                    units.add(parsed.getResult().get());
+                } else {
+                    System.err.println(
+                            "Could not parse Java file: " + javaFile);
                 }
             }
         }
 
-        Set<String> beans = new LinkedHashSet<>(beanClasses.keySet());
-
-        // Step 2: Find constructor-injected dependencies.
-        Set<Dependency> dependencies = new LinkedHashSet<>();
-
-        for (var entry : beanClasses.entrySet()) {
-            String sourceBean = entry.getKey();
-            ClassOrInterfaceDeclaration type = entry.getValue();
-
-            for (ConstructorDeclaration constructor :
-                    type.getConstructors()) {
-
-                for (var parameter : constructor.getParameters()) {
-                    String targetBean = simpleName(
-                            parameter.getType().asString()
-                    );
-
-                    if (beans.contains(targetBean)) {
-                        dependencies.add(
-                                new Dependency(sourceBean, targetBean)
-                        );
-                    }
-                }
-            }
-        }
-
-        // Step 3: Extract REST endpoints.
+        Set<String> beans = new TreeSet<>();
+        List<Dependency> dependencies = new ArrayList<>();
         List<Endpoint> endpoints = new ArrayList<>();
 
+        Map<String, String> simpleToQualified = new HashMap<>();
+        Map<String, List<String>> constructorParameters = new HashMap<>();
+
+        // Pass 1: detect Spring beans and constructor parameters.
         for (CompilationUnit unit : units) {
-            for (ClassOrInterfaceDeclaration type :
+
+            String packageName = unit.getPackageDeclaration()
+                    .map(p -> p.getNameAsString())
+                    .orElse("");
+
+            for (ClassOrInterfaceDeclaration declaration :
                     unit.findAll(ClassOrInterfaceDeclaration.class)) {
 
-                if (!type.getAnnotations().stream().anyMatch(a ->
-                        a.getNameAsString().equals("RestController")
-                                || a.getNameAsString().equals("Controller"))) {
+                String className = declaration.getNameAsString();
+
+                String qualifiedName = packageName.isEmpty()
+                        ? className
+                        : packageName + "." + className;
+
+                if (!hasBeanAnnotation(declaration)) {
                     continue;
                 }
 
-                List<String> classPaths = annotationPaths(
-                        type.getAnnotations(), "RequestMapping"
-                );
+                beans.add(qualifiedName);
+                simpleToQualified.put(className, qualifiedName);
 
-                if (classPaths.isEmpty()) {
-                    classPaths = List.of("");
+                List<String> parameters = new ArrayList<>();
+
+                for (ConstructorDeclaration constructor :
+                        declaration.getConstructors()) {
+
+                    constructor.getParameters().forEach(parameter ->
+                            parameters.add(
+                                    parameter.getType().asString()));
                 }
 
-                for (MethodDeclaration method :
-                        type.getMethods()) {
+                constructorParameters.put(qualifiedName, parameters);
+            }
+        }
 
-                    String httpMethod = null;
-                    List<String> methodPaths = new ArrayList<>();
+        // Pass 2: match constructor parameters to known beans.
+        for (Map.Entry<String, List<String>> entry :
+                constructorParameters.entrySet()) {
+
+            String sourceBean = entry.getKey();
+
+            for (String parameterType : entry.getValue()) {
+
+                String simpleType = getSimpleTypeName(parameterType);
+                String targetBean = simpleToQualified.get(simpleType);
+
+                if (targetBean != null) {
+                    dependencies.add(
+                            new Dependency(sourceBean, targetBean));
+                }
+            }
+        }
+
+        // Pass 3: detect REST endpoints.
+        for (CompilationUnit unit : units) {
+
+            String packageName = unit.getPackageDeclaration()
+                    .map(p -> p.getNameAsString())
+                    .orElse("");
+
+            for (ClassOrInterfaceDeclaration declaration :
+                    unit.findAll(ClassOrInterfaceDeclaration.class)) {
+
+                if (!isController(declaration)) {
+                    continue;
+                }
+
+                String controllerName = packageName.isEmpty()
+                        ? declaration.getNameAsString()
+                        : packageName + "." + declaration.getNameAsString();
+
+                List<String> classPaths =
+                        getMappingPaths(declaration.getAnnotations());
+
+                for (MethodDeclaration method :
+                        declaration.getMethods()) {
 
                     for (AnnotationExpr annotation :
                             method.getAnnotations()) {
 
                         String annotationName =
-                                annotation.getNameAsString();
+                                annotation.getName().getIdentifier();
 
-                        if (HTTP_MAPPINGS.containsKey(annotationName)) {
-                            httpMethod = HTTP_MAPPINGS.get(annotationName);
-                            methodPaths.addAll(
-                                    pathsFromAnnotation(annotation)
-                            );
-                        } else if (annotationName.equals("RequestMapping")) {
-                            methodPaths.addAll(
-                                    pathsFromAnnotation(annotation)
-                            );
-                            httpMethod = requestMethod(annotation);
+                        if (!MAPPING_ANNOTATIONS.contains(annotationName)) {
+                            continue;
                         }
-                    }
 
-                    if (httpMethod == null) {
-                        continue;
-                    }
+                        String httpMethod =
+                                getHttpMethod(annotationName, annotation);
 
-                    if (methodPaths.isEmpty()) {
-                        methodPaths.add("");
-                    }
+                        List<String> methodPaths =
+                                getMappingPaths(List.of(annotation));
 
-                    for (String base : classPaths) {
-                        for (String path : methodPaths) {
-                            endpoints.add(new Endpoint(
-                                    type.getNameAsString(),
-                                    httpMethod,
-                                    joinPaths(base, path)
-                            ));
+                        for (String classPath : classPaths) {
+                            for (String methodPath : methodPaths) {
+
+                                String fullPath =
+                                        combinePath(classPath, methodPath);
+
+                                endpoints.add(new Endpoint(
+                                        httpMethod,
+                                        fullPath,
+                                        controllerName,
+                                        method.getNameAsString()
+                                ));
+                            }
                         }
                     }
                 }
             }
         }
 
-        // Step 4: Detect circular dependencies using DFS.
-        Map<String, List<String>> graph = new LinkedHashMap<>();
+        List<String> cycles = findCycles(beans, dependencies);
+
+        dependencies.sort(
+                Comparator.comparing(Dependency::source)
+                        .thenComparing(Dependency::target));
+
+        endpoints.sort(
+                Comparator.comparing(Endpoint::controller)
+                        .thenComparing(Endpoint::path)
+                        .thenComparing(Endpoint::httpMethod));
+
+        return new AnalysisResult(
+                beans,
+                dependencies,
+                cycles,
+                endpoints
+        );
+    }
+
+    private String getSimpleTypeName(String type) {
+
+        String cleaned = type.trim();
+
+        // Remove generic parameters, e.g. List<MyService> -> List.
+        cleaned = cleaned.replaceAll("<.*>", "");
+
+        // Remove array suffixes.
+        while (cleaned.endsWith("[]")) {
+            cleaned = cleaned.substring(0, cleaned.length() - 2);
+        }
+
+        // Remove package name, e.g. com.example.MyService -> MyService.
+        int lastDot = cleaned.lastIndexOf('.');
+
+        if (lastDot >= 0) {
+            cleaned = cleaned.substring(lastDot + 1);
+        }
+
+        return cleaned.trim();
+    }
+
+    private boolean hasBeanAnnotation(
+            NodeWithAnnotations<?> declaration) {
+
+        for (AnnotationExpr annotation : declaration.getAnnotations()) {
+            if (BEAN_ANNOTATIONS.contains(
+                    annotation.getName().getIdentifier())) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private boolean isController(
+            ClassOrInterfaceDeclaration declaration) {
+
+        for (AnnotationExpr annotation : declaration.getAnnotations()) {
+            String name = annotation.getName().getIdentifier();
+
+            if (name.equals("RestController")
+                    || name.equals("Controller")) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private List<String> getMappingPaths(
+            NodeWithAnnotations<?> declaration) {
+
+        for (AnnotationExpr annotation : declaration.getAnnotations()) {
+
+            String name = annotation.getName().getIdentifier();
+
+            if (name.equals("RequestMapping")) {
+                return extractPaths(annotation);
+            }
+        }
+
+        return List.of("");
+    }
+
+    private List<String> getMappingPaths(
+            List<AnnotationExpr> annotations) {
+
+        for (AnnotationExpr annotation : annotations) {
+            if (MAPPING_ANNOTATIONS.contains(
+                    annotation.getName().getIdentifier())) {
+                return extractPaths(annotation);
+            }
+        }
+
+        return List.of("");
+    }
+
+    private List<String> extractPaths(AnnotationExpr annotation) {
+
+        if (annotation instanceof SingleMemberAnnotationExpr single) {
+            return extractStringValues(single.getMemberValue());
+        }
+
+        if (annotation instanceof NormalAnnotationExpr normal) {
+
+            for (var pair : normal.getPairs()) {
+
+                String name = pair.getNameAsString();
+
+                if (name.equals("value") || name.equals("path")) {
+                    return extractStringValues(pair.getValue());
+                }
+            }
+        }
+
+        return List.of("");
+    }
+
+    private List<String> extractStringValues(Expression expression) {
+
+        if (expression instanceof StringLiteralExpr literal) {
+            return List.of(literal.asString());
+        }
+
+        if (expression instanceof ArrayInitializerExpr array) {
+
+            List<String> values = new ArrayList<>();
+
+            for (Expression value : array.getValues()) {
+                if (value instanceof StringLiteralExpr literal) {
+                    values.add(literal.asString());
+                }
+            }
+
+            return values.isEmpty() ? List.of("") : values;
+        }
+
+        return List.of("");
+    }
+
+    private String getHttpMethod(
+            String annotationName,
+            AnnotationExpr annotation) {
+
+        return switch (annotationName) {
+            case "GetMapping" -> "GET";
+            case "PostMapping" -> "POST";
+            case "PutMapping" -> "PUT";
+            case "DeleteMapping" -> "DELETE";
+            case "PatchMapping" -> "PATCH";
+            default -> getRequestMethod(annotation);
+        };
+    }
+
+    private String getRequestMethod(AnnotationExpr annotation) {
+
+        if (!(annotation instanceof NormalAnnotationExpr normal)) {
+            return "REQUEST";
+        }
+
+        for (var pair : normal.getPairs()) {
+
+            if (!pair.getNameAsString().equals("method")) {
+                continue;
+            }
+
+            String value = pair.getValue().toString();
+
+            if (value.contains("GET")) return "GET";
+            if (value.contains("POST")) return "POST";
+            if (value.contains("PUT")) return "PUT";
+            if (value.contains("DELETE")) return "DELETE";
+            if (value.contains("PATCH")) return "PATCH";
+            if (value.contains("OPTIONS")) return "OPTIONS";
+            if (value.contains("HEAD")) return "HEAD";
+        }
+
+        return "REQUEST";
+    }
+
+    private String combinePath(String base, String method) {
+
+        String combined = (base + "/" + method)
+                .replaceAll("/+", "/");
+
+        if (!combined.startsWith("/")) {
+            combined = "/" + combined;
+        }
+
+        if (combined.length() > 1 && combined.endsWith("/")) {
+            combined = combined.substring(0, combined.length() - 1);
+        }
+
+        return combined;
+    }
+
+    private List<String> findCycles(
+            Set<String> beans,
+            List<Dependency> dependencies) {
+
+        Map<String, List<String>> graph = new HashMap<>();
 
         for (String bean : beans) {
             graph.put(bean, new ArrayList<>());
         }
 
         for (Dependency dependency : dependencies) {
-            graph.get(dependency.source()).add(dependency.target());
+            graph.computeIfAbsent(
+                            dependency.source(),
+                            ignored -> new ArrayList<>())
+                    .add(dependency.target());
         }
 
-        List<String> cycles = findCycles(graph);
-
-        return new AnalysisResult(
-                beans,
-                new ArrayList<>(dependencies),
-                cycles,
-                endpoints
-        );
-    }
-
-    private String simpleName(String type) {
-        String name = type.substring(type.lastIndexOf('.') + 1);
-
-        // Handle simple generic types such as List<UserService>.
-        int genericStart = name.indexOf('<');
-        if (genericStart >= 0) {
-            name = name.substring(0, genericStart);
-        }
-
-        return name;
-    }
-
-    private List<String> annotationPaths(
-            NodeList<AnnotationExpr> annotations,
-            String name
-    ) {
-        List<String> result = new ArrayList<>();
-
-        for (AnnotationExpr annotation : annotations) {
-            if (annotation.getNameAsString().equals(name)) {
-                result.addAll(pathsFromAnnotation(annotation));
-            }
-        }
-
-        return result;
-    }
-
-    private List<String> pathsFromAnnotation(AnnotationExpr annotation) {
-        List<String> result = new ArrayList<>();
-
-        if (annotation instanceof SingleMemberAnnotationExpr single) {
-            addStringValues(single.getMemberValue(), result);
-        }
-
-        if (annotation instanceof NormalAnnotationExpr normal) {
-            for (MemberValuePair pair : normal.getPairs()) {
-                if (pair.getNameAsString().equals("value")
-                        || pair.getNameAsString().equals("path")) {
-                    addStringValues(pair.getValue(), result);
-                }
-            }
-        }
-
-        return result;
-    }
-
-    private void addStringValues(
-            Expression expression,
-            List<String> result
-    ) {
-        if (expression instanceof StringLiteralExpr literal) {
-            result.add(literal.asString());
-        } else if (expression instanceof ArrayInitializerExpr array) {
-            for (Expression item : array.getValues()) {
-                addStringValues(item, result);
-            }
-        }
-    }
-
-    private String requestMethod(AnnotationExpr annotation) {
-        if (annotation instanceof NormalAnnotationExpr normal) {
-            for (MemberValuePair pair : normal.getPairs()) {
-                if (pair.getNameAsString().equals("method")) {
-                    String value = pair.getValue().toString();
-
-                    if (value.contains("RequestMethod.")) {
-                        return value.substring(
-                                value.lastIndexOf('.') + 1
-                        );
-                    }
-                }
-            }
-        }
-
-        return "ANY";
-    }
-
-    private String joinPaths(String base, String path) {
-        String joined = (base + "/" + path)
-                .replaceAll("/+", "/");
-
-        if (joined.isEmpty()) {
-            return "/";
-        }
-
-        return joined.startsWith("/") ? joined : "/" + joined;
-    }
-
-    private List<String> findCycles(
-            Map<String, List<String>> graph
-    ) {
-        List<String> cycles = new ArrayList<>();
         Set<String> visited = new HashSet<>();
         Set<String> active = new HashSet<>();
-        List<String> stack = new ArrayList<>();
+        Deque<String> stack = new ArrayDeque<>();
+        Set<String> cycles = new LinkedHashSet<>();
 
-        for (String bean : graph.keySet()) {
-            dfs(bean, graph, visited, active, stack, cycles);
+        for (String bean : beans) {
+            detectCycle(
+                    bean, graph, visited, active, stack, cycles);
         }
 
-        return cycles;
+        return new ArrayList<>(cycles);
     }
 
-    private void dfs(
+    private void detectCycle(
             String bean,
             Map<String, List<String>> graph,
             Set<String> visited,
             Set<String> active,
-            List<String> stack,
-            List<String> cycles
-    ) {
+            Deque<String> stack,
+            Set<String> cycles) {
+
         if (active.contains(bean)) {
-            int start = stack.indexOf(bean);
 
-            if (start >= 0) {
-                List<String> cycle = new ArrayList<>(
-                        stack.subList(start, stack.size())
-                );
-                cycle.add(bean);
+            List<String> cycle = new ArrayList<>();
+            boolean recording = false;
 
-                String description = String.join(" -> ", cycle);
-
-                if (!cycles.contains(description)) {
-                    cycles.add(description);
+            for (String item : stack) {
+                if (item.equals(bean)) {
+                    recording = true;
                 }
+
+                if (recording) {
+                    cycle.add(item);
+                }
+            }
+
+            cycle.add(bean);
+
+            if (!cycle.isEmpty()) {
+                cycles.add(String.join(" -> ", cycle));
             }
 
             return;
@@ -341,14 +471,37 @@ public class SourceAnalyzer {
 
         visited.add(bean);
         active.add(bean);
-        stack.add(bean);
+        stack.addLast(bean);
 
         for (String dependency :
-                graph.getOrDefault(bean, List.of())) {
-            dfs(dependency, graph, visited, active, stack, cycles);
+                graph.getOrDefault(bean, Collections.emptyList())) {
+
+            detectCycle(
+                    dependency,
+                    graph,
+                    visited,
+                    active,
+                    stack,
+                    cycles);
         }
 
-        stack.remove(stack.size() - 1);
+        stack.removeLast();
         active.remove(bean);
     }
+
+    public record Dependency(
+            String source,
+            String target) {}
+
+    public record Endpoint(
+            String httpMethod,
+            String path,
+            String controller,
+            String methodName) {}
+
+    public record AnalysisResult(
+            Set<String> beans,
+            List<Dependency> dependencies,
+            List<String> cycles,
+            List<Endpoint> endpoints) {}
 }
